@@ -3,15 +3,23 @@ from data_loader import prepare_data, evaluate_predictions
 import numpy as np
 import json
 import random
+import pickle
+import os
+import matplotlib.pyplot as plt
 
 # Set random seeds for reproducibility
 np.random.seed(42)
 random.seed(42)
 
+# Create directories if they don't exist
+os.makedirs('models', exist_ok=True)
+os.makedirs('plots', exist_ok=True)
+
 # Prepare data
-data = prepare_data(train_path='Train_CRF.csv', 
-                   test_path='Test_CRF.csv',
-                   val_path='ner_test.csv')
+data = prepare_data(train_path='data/ner_train.csv', 
+                   test_path='data/ner_test.csv',
+                   val_path=None,  # Use split from training data
+                   val_split=0.1)  # Use 10% of training data for validation
 
 # Extract features and labels
 train_features = data['train']['features']
@@ -37,17 +45,50 @@ print(f"Test sequences: {len(test_features)}")
 model = CRF(num_states=num_states, num_features=num_features, l2_reg=l2_reg)
 
 # Train with improved parameters
-model.train(
+history = model.train(
     features_list=train_features,
     labels_list=train_labels,
     validation_features=val_features,
     validation_labels=val_labels,
-    learning_rate=0.0005,  # Reduced learning rate
-    num_iterations=300,    # Increased iterations
-    patience=50,          # Increased patience
-    min_iterations=150,   # Increased minimum iterations
-    batch_size=16        # Small batch size for better generalization
+    learning_rate=0.001,    # Initial learning rate
+    num_iterations=100,     # Moderate number of iterations
+    patience=20,           # Shorter patience for quicker stopping
+    min_iterations=30,     # Lower minimum iterations
+    batch_size=16         # Smaller batch size for better gradient estimates
 )
+
+# Plot training history
+plt.figure(figsize=(10, 6))
+plt.plot(history['train_loss'], label='Training Loss')
+plt.plot(history['val_loss'], label='Validation Loss')
+plt.title('CRF Model Training History')
+plt.xlabel('Iteration')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True)
+
+# Save the plot
+plot_path = 'plots/training_history.png'
+plt.savefig(plot_path)
+plt.close()
+
+print(f"\nTraining history plot saved to {plot_path}")
+
+# Create models directory if it doesn't exist
+os.makedirs('models', exist_ok=True)
+
+# Save the trained model
+model_path = 'models/crf_model.pkl'
+with open(model_path, 'wb') as f:
+    pickle.dump(model, f)
+
+# Save the label dictionary separately for easier access
+label_dict_path = 'models/label_dict.pkl'
+with open(label_dict_path, 'wb') as f:
+    pickle.dump(label_dict, f)
+
+print(f"\nModel saved to {model_path}")
+print(f"Label dictionary saved to {label_dict_path}")
 
 # Make predictions on test set
 predictions = []
@@ -63,6 +104,9 @@ print("\nOverall Metrics:")
 print(f"Precision: {metrics['overall']['precision']:.4f}")
 print(f"Recall: {metrics['overall']['recall']:.4f}")
 print(f"F1 Score: {metrics['overall']['f1']:.4f}")
+print(f"True Positives: {metrics['overall']['true_positives']}")
+print(f"False Positives: {metrics['overall']['false_positives']}")
+print(f"False Negatives: {metrics['overall']['false_negatives']}")
 
 # Print per-label metrics
 print("\nPer-label Metrics:")
@@ -71,6 +115,7 @@ for label, scores in metrics['per_label'].items():
     print(f"Precision: {scores['precision']:.4f}")
     print(f"Recall: {scores['recall']:.4f}")
     print(f"F1 Score: {scores['f1']:.4f}")
+    print(f"Support: {scores['support']}")
 
 # Save results
 with open('results.json', 'w') as f:
