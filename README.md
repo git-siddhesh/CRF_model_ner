@@ -252,5 +252,3 @@ The training process combines:
 - Numerical stability considerations
 
 This creates a robust model for sequence labeling tasks like Named Entity Recognition (NER).
-
-Would you like me to elaborate on any specific theoretical aspect?
