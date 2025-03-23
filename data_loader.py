@@ -3,16 +3,50 @@ import numpy as np
 from typing import List, Tuple, Dict
 import ast
 from sklearn.feature_selection import mutual_info_classif
+import torch
+
+# Global variables for feature extraction
+WORD_VOCAB = {}  # Will be initialized during data loading
+POS_VOCAB = {}   # Will be initialized during data loading
+UNK_IDX = 0      # Index for unknown tokens
+
+def initialize_vocabularies(sequences: List[List[str]], pos_tags: List[List[str]], min_word_freq: int = 3):
+    """Initialize word and POS tag vocabularies with frequency thresholding"""
+    global WORD_VOCAB, POS_VOCAB
+    
+    # Initialize word vocabulary with frequency counting
+    word_freq = {}
+    for sequence in sequences:
+        for word in sequence:
+            word = word.lower()
+            word_freq[word] = word_freq.get(word, 0) + 1
+    
+    # Filter words by frequency threshold
+    frequent_words = {word for word, freq in word_freq.items() if freq >= min_word_freq}
+    WORD_VOCAB = {word: idx + 1 for idx, word in enumerate(sorted(frequent_words))}  # 0 reserved for UNK
+    
+    # Initialize POS vocabulary (keep all POS tags as they are usually limited)
+    pos_set = set()
+    for pos_sequence in pos_tags:
+        for pos in pos_sequence:
+            pos_set.add(pos)
+    POS_VOCAB = {pos: idx for idx, pos in enumerate(sorted(pos_set))}
+    
+    # Calculate total number of features
+    global NUM_FEATURES
+    NUM_FEATURES = (len(WORD_VOCAB) + 1 +  # Add 1 for UNK token
+                   len(POS_VOCAB) +
+                   4)  # Additional features: capitalization (3) + numeric (1)
+    
+    print(f"Vocabulary sizes after frequency filtering (min_freq={min_word_freq}):")
+    print(f"Words: {len(WORD_VOCAB)} (reduced from {len(word_freq)})")
+    print(f"POS tags: {len(POS_VOCAB)}")
+    print(f"Total features: {NUM_FEATURES}")
 
 def load_csv_data(file_path: str) -> Tuple[List[List[str]], List[List[str]], List[List[str]]]:
     """
-    Load data from CSV file and convert to sequences of words, POS tags, and labels
-    
-    Args:
-        file_path: Path to the CSV file
-        
-    Returns:
-        Tuple of (sequences, pos_tags, labels)
+    Load data from CSV file and convert to sequences of words, POS tags, and labels.
+    Handles mismatched sequences and sorts by length for efficient batching.
     """
     df = pd.read_csv(file_path)
     
@@ -20,20 +54,46 @@ def load_csv_data(file_path: str) -> Tuple[List[List[str]], List[List[str]], Lis
     pos_tags = []
     labels = []
     
+    skipped = 0
+    fixed = 0
+    
     for _, row in df.iterrows():
         # Convert string representations of lists to actual lists
         sentence = row['Sentence'].split()
         pos = ast.literal_eval(row['POS'])
         tags = ast.literal_eval(row['Tag'])
         
-        # Ensure lengths match
-        if len(sentence) != len(tags) or len(sentence) != len(pos):
-            print(f"Warning: Mismatched lengths in sentence: {len(sentence)} words, {len(pos)} POS tags, {len(tags)} NER tags")
-            continue
+        # Handle mismatched lengths
+        min_len = min(len(sentence), len(pos), len(tags))
+        max_len = max(len(sentence), len(pos), len(tags))
+        
+        if min_len != max_len:
+            if abs(len(sentence) - len(pos)) <= 2 and abs(len(sentence) - len(tags)) <= 2:
+                # Fix minor misalignments by truncating to shortest length
+                sentence = sentence[:min_len]
+                pos = pos[:min_len]
+                tags = tags[:min_len]
+                fixed += 1
+            else:
+                # Skip sequences with major misalignments
+                skipped += 1
+                continue
             
         sequences.append(sentence)
         pos_tags.append(pos)
         labels.append(tags)
+    
+    if skipped > 0 or fixed > 0:
+        print(f"\nSequence length handling:")
+        print(f"- Fixed {fixed} sequences with minor misalignments")
+        print(f"- Skipped {skipped} sequences with major misalignments")
+        print(f"- Retained {len(sequences)} valid sequences")
+    
+    # Sort sequences by length for more efficient batching
+    sorted_indices = sorted(range(len(sequences)), key=lambda i: len(sequences[i]))
+    sequences = [sequences[i] for i in sorted_indices]
+    pos_tags = [pos_tags[i] for i in sorted_indices]
+    labels = [labels[i] for i in sorted_indices]
     
     return sequences, pos_tags, labels
 
@@ -156,24 +216,39 @@ def apply_feature_template(template: Dict, sequence: List[str], pos_tags: List[s
     
     return features
 
-def extract_features(sequence: List[str], pos_tags: List[str]) -> np.ndarray:
+def extract_features(sequence: List[str], pos_tags: List[str]) -> torch.Tensor:
     """
-    Extract features from a sequence using templates
+    Extract features for a sequence using PyTorch tensors
     """
-    # Get feature templates from CRF model
-    from crf_model import CRF
-    dummy_crf = CRF(2, 2)  # Temporary instance to get templates
-    templates = dummy_crf.feature_templates
-    
     features = []
-    for i in range(len(sequence)):
-        position_features = []
-        for template in templates:
-            template_features = apply_feature_template(template, sequence, pos_tags, i)
-            position_features.extend(template_features)
-        features.append(position_features)
+    for i, (word, pos) in enumerate(zip(sequence, pos_tags)):
+        # Word features
+        word_lower = word.lower()
+        
+        # Initialize feature vector with zeros
+        feature_vec = torch.zeros(NUM_FEATURES)
+        
+        # Word identity features
+        feature_vec[WORD_VOCAB.get(word_lower, UNK_IDX)] = 1.0
+        
+        # POS tag features
+        feature_vec[len(WORD_VOCAB) + POS_VOCAB.get(pos, UNK_IDX)] = 1.0
+        
+        # Capitalization features
+        if word[0].isupper():
+            feature_vec[-4] = 1.0
+        if word.isupper():
+            feature_vec[-3] = 1.0
+        if any(c.isupper() for c in word[1:]):
+            feature_vec[-2] = 1.0
+            
+        # Numeric feature
+        if any(c.isdigit() for c in word):
+            feature_vec[-1] = 1.0
+            
+        features.append(feature_vec)
     
-    return np.array(features)
+    return torch.stack(features)
 
 def create_word_features(sequence: List[str], position: int) -> List[float]:
     """
@@ -377,71 +452,121 @@ def apply_feature_selection(features_list: List[np.ndarray], selected_features: 
     """
     return [features[:, selected_features] for features in features_list]
 
-def prepare_data(train_path: str, test_path: str, val_path: str = None, val_split: float = 0.1) -> Dict:
+def prepare_data(train_path: str, test_path: str, val_path: str = None, 
+              val_split: float = 0.1, device: str = None, batch_size: int = 32) -> Dict:
     """
-    Prepare data for CRF model training and evaluation with feature selection
+    Prepare data for CRF model training and evaluation with GPU support and memory management
+    """
+    # Set device
+    if device is None:
+        device = torch.device("mps" if torch.backends.mps.is_available() else
+                            "cuda" if torch.cuda.is_available() else "cpu")
     
-    Args:
-        train_path: Path to training data
-        test_path: Path to test data
-        val_path: Path to validation data (optional)
-        val_split: Fraction of training data to use for validation if val_path is None
-    """
     # Load all data first
     train_sequences, train_pos, train_labels = load_csv_data(train_path)
     test_sequences, test_pos, test_labels = load_csv_data(test_path)
     
-    # Collect all labels to create a complete label dictionary
-    all_labels = train_labels.copy()
-    all_labels.extend(test_labels)
+    # Initialize vocabularies
+    all_sequences = train_sequences + test_sequences
+    all_pos_tags = train_pos + test_pos
+    initialize_vocabularies(all_sequences, all_pos_tags)
     
-    if val_path:
-        val_sequences, val_pos, val_labels = load_csv_data(val_path)
-        all_labels.extend(val_labels)
-    else:
-        # Split training data into train and validation sets
-        num_val = int(len(train_sequences) * val_split)
-        indices = np.random.permutation(len(train_sequences))
-        val_indices = indices[:num_val]
-        train_indices = indices[num_val:]
-        
-        # Create validation set
-        val_sequences = [train_sequences[i] for i in val_indices]
-        val_pos = [train_pos[i] for i in val_indices]
-        val_labels = [train_labels[i] for i in val_indices]
-        
-        # Update training set
-        train_sequences = [train_sequences[i] for i in train_indices]
-        train_pos = [train_pos[i] for i in train_indices]
-        train_labels = [train_labels[i] for i in train_indices]
-        
-        print(f"Split training data: {len(train_sequences)} train, {len(val_sequences)} validation sequences")
+    print(f"Vocabulary sizes - Words: {len(WORD_VOCAB)}, POS tags: {len(POS_VOCAB)}")
+    print(f"Total number of features: {NUM_FEATURES}")
     
-    # Create label dictionary from all available data
-    label_dict = create_label_dictionary(all_labels)
-    print("Label dictionary:", label_dict)
+    # Process data in batches
+    def process_batch(sequences, pos_tags, start_idx, end_idx, device):
+        """Process a batch of sequences with better memory management using float16"""
+        batch_features = []
+        for seq, pos in zip(sequences[start_idx:end_idx], pos_tags[start_idx:end_idx]):
+            try:
+                # Process each sequence
+                features = extract_features(seq, pos)
+                # Convert to float16 tensor efficiently
+                features_tensor = features.clone().detach().to(dtype=torch.float16)
+                
+                if device.type == 'mps':
+                    try:
+                        features_tensor = features_tensor.to(device)
+                    except RuntimeError:
+                        print(".", end="", flush=True)
+                        if torch.mps.is_available():
+                            torch.mps.empty_cache()
+                        features_tensor = features_tensor.cpu()
+                else:
+                    features_tensor = features_tensor.to(device)
+                
+                batch_features.append(features_tensor)
+                
+                # Clear cache more frequently
+                if len(batch_features) % 5 == 0:  # Reduced from 10 to 5
+                    if device.type == 'mps':
+                        import gc
+                        gc.collect()
+                        torch.mps.empty_cache()
+                    elif device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    
+            except RuntimeError as e:
+                print(f"\nWarning: Error processing sequence: {e}")
+                # Fallback to CPU processing with float16
+                features = extract_features(seq, pos)
+                features_tensor = features.clone().detach().to(dtype=torch.float16).cpu()
+                batch_features.append(features_tensor)
+            
+        return batch_features
     
-    # Extract initial features
-    train_features = [extract_features(seq, pos) for seq, pos in zip(train_sequences, train_pos)]
-    test_features = [extract_features(seq, pos) for seq, pos in zip(test_sequences, test_pos)]
+    # Process training data in batches
+    train_features = []
+    for i in range(0, len(train_sequences), batch_size):
+        end_idx = min(i + batch_size, len(train_sequences))
+        batch_features = process_batch(train_sequences, train_pos, i, end_idx, device)
+        train_features.extend(batch_features)
+        
+        # Clear cache after each batch
+        if device.type == 'mps':
+            torch.mps.empty_cache()
+    
+    # Process test data in batches
+    test_features = []
+    for i in range(0, len(test_sequences), batch_size):
+        end_idx = min(i + batch_size, len(test_sequences))
+        batch_features = process_batch(test_sequences, test_pos, i, end_idx, device)
+        test_features.extend(batch_features)
+        
+        # Clear cache after each batch
+        if device.type == 'mps':
+            torch.mps.empty_cache()
+    
+    # Create label dictionary
+    label_dict = create_label_dictionary(train_labels + test_labels)
     
     # Convert labels to indices
-    train_labels_indices = convert_labels_to_indices(train_labels, label_dict)
-    test_labels_indices = convert_labels_to_indices(test_labels, label_dict)
+    train_labels_indices = [torch.tensor(convert_labels_to_indices([labels], label_dict)[0], 
+                                       dtype=torch.long, device=device)
+                          for labels in train_labels]
+    test_labels_indices = [torch.tensor(convert_labels_to_indices([labels], label_dict)[0],
+                                      dtype=torch.long, device=device)
+                         for labels in test_labels]
     
-    # Perform feature selection on training data
-    selected_features = select_informative_features(train_features, train_labels_indices)
-    
-    # Apply feature selection
-    train_features = apply_feature_selection(train_features, selected_features)
-    test_features = apply_feature_selection(test_features, selected_features)
-    
-    # Prepare validation data if provided
+    # Handle validation data
     val_data = None
     if val_path:
-        val_features = [extract_features(seq, pos) for seq, pos in zip(val_sequences, val_pos)]
-        val_features = apply_feature_selection(val_features, selected_features)
-        val_labels_indices = convert_labels_to_indices(val_labels, label_dict)
+        val_sequences, val_pos, val_labels = load_csv_data(val_path)
+        # Process validation data in batches
+        val_features = []
+        for i in range(0, len(val_sequences), batch_size):
+            end_idx = min(i + batch_size, len(val_sequences))
+            batch_features = process_batch(val_sequences, val_pos, i, end_idx, device)
+            val_features.extend(batch_features)
+            
+            # Clear cache after each batch
+            if device.type == 'mps':
+                torch.mps.empty_cache()
+                
+        val_labels_indices = [torch.tensor(convert_labels_to_indices([labels], label_dict)[0],
+                                         dtype=torch.long, device=device)
+                            for labels in val_labels]
         val_data = {
             'features': val_features,
             'labels': val_labels_indices,
@@ -449,6 +574,36 @@ def prepare_data(train_path: str, test_path: str, val_path: str = None, val_spli
             'pos_tags': val_pos,
             'original_labels': val_labels
         }
+    else:
+        # Split training data
+        num_val = int(len(train_sequences) * val_split)
+        indices = torch.randperm(len(train_sequences))
+        val_indices = indices[:num_val].tolist()
+        train_indices = indices[num_val:].tolist()
+        
+        # Update training and create validation sets
+        val_features = [train_features[i] for i in val_indices]
+        val_labels_indices = [train_labels_indices[i] for i in val_indices]
+        val_sequences = [train_sequences[i] for i in val_indices]
+        val_pos = [train_pos[i] for i in val_indices]
+        val_labels = [train_labels[i] for i in val_indices]
+        
+        # Update training set
+        train_features = [train_features[i] for i in train_indices]
+        train_labels_indices = [train_labels_indices[i] for i in train_indices]
+        train_sequences = [train_sequences[i] for i in train_indices]
+        train_pos = [train_pos[i] for i in train_indices]
+        train_labels = [train_labels[i] for i in train_indices]
+        
+        val_data = {
+            'features': val_features,
+            'labels': val_labels_indices,
+            'sequences': val_sequences,
+            'pos_tags': val_pos,
+            'original_labels': val_labels
+        }
+        
+        print(f"Split training data: {len(train_sequences)} train, {len(val_sequences)} validation sequences")
     
     return {
         'train': {
@@ -467,85 +622,72 @@ def prepare_data(train_path: str, test_path: str, val_path: str = None, val_spli
         },
         'validation': val_data,
         'label_dict': label_dict,
-        'num_features': train_features[0].shape[1],
+        'num_features': train_features[0].shape[1] if train_features else NUM_FEATURES,
         'num_states': len(label_dict),
-        'selected_features': selected_features
+        'device': device
     }
 
-def evaluate_predictions(predictions: List[np.ndarray], true_labels: List[np.ndarray], 
-                        label_dict: Dict[str, int]) -> Dict[str, Dict[str, float]]:
+def evaluate_predictions(true_labels: List[torch.Tensor], pred_labels: List[torch.Tensor], 
+                       label_dict: Dict[str, int]) -> Dict:
     """
-    Evaluate model predictions using precision, recall, and F1 score
-    
-    Args:
-        predictions: List of predicted label arrays
-        true_labels: List of true label arrays
-        label_dict: Dictionary mapping labels to indices
-        
-    Returns:
-        Dictionary containing evaluation metrics
+    Evaluate predictions using PyTorch tensors
     """
-    # Convert predictions and true labels to lists of strings
-    pred_labels = []
-    true_labels_str = []
+    # Convert tensors to CPU for evaluation
+    true_labels = [labels.cpu() for labels in true_labels]
+    pred_labels = [labels.cpu() for labels in pred_labels]
     
-    # Create reverse mapping from index to label
-    idx_to_label = {idx: label for label, idx in label_dict.items()}
+    # Create reverse label dictionary
+    rev_label_dict = {v: k for k, v in label_dict.items()}
     
-    # Convert all labels to strings
-    for pred, true in zip(predictions, true_labels):
-        pred_labels.extend([idx_to_label[p] for p in pred])
-        true_labels_str.extend([idx_to_label[t] for t in true])
-    
-    # Initialize metrics dictionary
     metrics = {
-        'per_label': {},
-        'overall': {'true_positives': 0, 'false_positives': 0, 'false_negatives': 0}
+        'overall': {'true_positives': 0, 'false_positives': 0, 'false_negatives': 0},
+        'per_label': {label: {'true_positives': 0, 'false_positives': 0, 
+                             'false_negatives': 0, 'support': 0}
+                     for label in label_dict}
     }
     
-    # Calculate metrics for each label
-    for label in label_dict.keys():
-        if label == 'O':  # Skip 'O' tag for individual metrics
-            continue
+    for true_seq, pred_seq in zip(true_labels, pred_labels):
+        for true_label, pred_label in zip(true_seq, pred_seq):
+            true_label_str = rev_label_dict[true_label.item()]
+            pred_label_str = rev_label_dict[pred_label.item()]
             
-        true_positives = sum(1 for p, t in zip(pred_labels, true_labels_str) 
-                           if p == label and t == label)
-        false_positives = sum(1 for p, t in zip(pred_labels, true_labels_str) 
-                            if p == label and t != label)
-        false_negatives = sum(1 for p, t in zip(pred_labels, true_labels_str) 
-                            if p != label and t == label)
-        
-        # Update overall counts
-        metrics['overall']['true_positives'] += true_positives
-        metrics['overall']['false_positives'] += false_positives
-        metrics['overall']['false_negatives'] += false_negatives
-        
-        # Calculate precision, recall, F1 for this label
-        precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0.0
-        recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-        
-        metrics['per_label'][label] = {
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'support': true_positives + false_negatives
-        }
+            # Update per-label metrics
+            metrics['per_label'][true_label_str]['support'] += 1
+            if true_label_str == pred_label_str:
+                if true_label_str != 'O':  # Only count non-O labels
+                    metrics['overall']['true_positives'] += 1
+                    metrics['per_label'][true_label_str]['true_positives'] += 1
+            else:
+                if true_label_str != 'O':
+                    metrics['overall']['false_negatives'] += 1
+                    metrics['per_label'][true_label_str]['false_negatives'] += 1
+                if pred_label_str != 'O':
+                    metrics['overall']['false_positives'] += 1
+                    metrics['per_label'][pred_label_str]['false_positives'] += 1
     
-    # Calculate overall metrics
-    overall = metrics['overall']
-    overall_precision = overall['true_positives'] / (overall['true_positives'] + overall['false_positives']) if (overall['true_positives'] + overall['false_positives']) > 0 else 0.0
-    overall_recall = overall['true_positives'] / (overall['true_positives'] + overall['false_negatives']) if (overall['true_positives'] + overall['false_negatives']) > 0 else 0.0
-    overall_f1 = 2 * (overall_precision * overall_recall) / (overall_precision + overall_recall) if (overall_precision + overall_recall) > 0 else 0.0
+    # Calculate precision, recall, and F1 score
+    def calculate_metrics(tp, fp, fn):
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        return precision, recall, f1
     
-    metrics['overall'] = {
-        'precision': overall_precision,
-        'recall': overall_recall,
-        'f1': overall_f1,
-        'true_positives': overall['true_positives'],
-        'false_positives': overall['false_positives'],
-        'false_negatives': overall['false_negatives']
-    }
+    # Overall metrics
+    precision, recall, f1 = calculate_metrics(
+        metrics['overall']['true_positives'],
+        metrics['overall']['false_positives'],
+        metrics['overall']['false_negatives']
+    )
+    metrics['overall'].update({'precision': precision, 'recall': recall, 'f1': f1})
+    
+    # Per-label metrics
+    for label in metrics['per_label']:
+        precision, recall, f1 = calculate_metrics(
+            metrics['per_label'][label]['true_positives'],
+            metrics['per_label'][label]['false_positives'],
+            metrics['per_label'][label]['false_negatives']
+        )
+        metrics['per_label'][label].update({'precision': precision, 'recall': recall, 'f1': f1})
     
     return metrics
 
